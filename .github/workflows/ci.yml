@@ -1,0 +1,23 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # Proves the kernel compiles for sm_70 under a CUDA 12.x toolchain —
+  # exactly the toolchain a V100 box runs. (No GPU on runners: compile-only;
+  # the selftest gate runs on real hardware.)
+  build-sm70:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Jimver/cuda-toolkit@v0.2.19
+        with:
+          cuda: '12.4.1'
+          method: network
+          sub-packages: '["nvcc", "cudart-dev"]'
+      - name: configure
+        run: cmake -B build -S . -DCMAKE_CUDA_ARCHITECTURES=70 -DCMAKE_BUILD_TYPE=Release
+      - name: build
+        run: cmake --build build --verbose
