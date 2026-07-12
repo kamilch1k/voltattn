@@ -44,11 +44,12 @@ Two Volta-specific design pressures actually shaped the code:
 
 ## The finding: compression alone didn't pay — memory-level parallelism did
 
-First-cut kernels (one warp per position, 32 lanes across D) hold ~95% MBU at
+First-cut kernels (one warp per position, 32 lanes across D) hold ~93% MBU at
 fp16 — but collapse to 25–60% MBU when quantized. Fewer bytes per position
 means the fixed per-position cost (a 5-step warp reduce + the dependent
-online-softmax update) dominates, and the memory system starves. At L=64K,
-INT4 was *slower* than fp16 — compression fully wasted.
+online-softmax update) dominates, and the memory system starves. On the V100
+target the naive kernels never beat fp16 at all (q4 is a 20% *slowdown*) —
+compression fully wasted.
 
 The `q8+`/`q4+` kernels restructure to 8 lanes per position with 4 positions
 in flight per warp: 4× the loads issued per iteration (128-bit loads for
@@ -58,63 +59,84 @@ to interleave. Measured on the development GPU (RTX 4080 Laptop, sm_89,
 
 | fmt | L | best ms | GB/s | MBU | tok/s | vs f16 |
 |-----|-------|---------|-------|-------|-------|--------|
-| f16 | 16384 | 0.675 | 397.8 | 94.4% | 1482 | 1.00× |
-| q8 (naive) | 16384 | 0.556 | 248.9 | 59.1% | 1798 | 1.21× |
-| **q8+** | 16384 | **0.339** | **408.4** | **96.9%** | **2950** | **1.99×** |
-| q4 (naive) | 16384 | 0.599 | 119.0 | 28.2% | 1670 | 1.13× |
-| **q4+** | 16384 | **0.278** | **256.3** | **60.8%** | **3595** | **2.43×** |
+| f16 | 16384 | 0.688 | 390.1 | 92.6% | 1453 | 1.00× |
+| f16+ | 16384 | 0.644 | 416.8 | 98.9% | 1553 | 1.07× |
+| q8 (naive) | 16384 | 0.550 | 251.7 | 59.7% | 1819 | 1.25× |
+| **q8+** | 16384 | **0.339** | **408.4** | **96.9%** | **2950** | **2.03×** |
+| q4 (naive) | 16384 | 0.597 | 119.4 | 28.3% | 1675 | 1.15× |
+| **q4+** | 16384 | **0.451** | 158.3 | 37.5% | 2219 | 1.53× |
 
-At L=4096: f16 5711 tok/s → q8+ 11097 (1.94×) → q4+ 13754 (2.41×).
-At L=65536: q8+ holds **98.7% MBU (2.02×)** — INT8's byte ratio is 1.94×, so
+At L=4096: f16 5756 tok/s → q8+ 10973 (1.91×) → q4+ 14147 (2.46×).
+At L=65536: q8+ holds **98.6% MBU (2.03×)** — INT8's byte ratio is 1.94×, so
 INT8 compression converts to speed at effectively full efficiency.
+
+**f16+** — the same restructure with *no* quantization, added as the
+attribution control — barely moves on Ada (1.04–1.07×): this baseline is
+already at the roof, so here the speedup really is compression. On Volta it
+is a different story (below).
+
+Laptop honesty note: the memory-bound rows (f16 / f16+ / q8+) reproduce to
+three digits across runs; the ALU-dense q4 rows swing with the host's DVFS
+and desktop load (q4+ at L=16K measured from 0.28 ms / 2.4× on a quiet run
+to 0.45 ms / 1.5× — the table shows a typical run, not the best one), and
+L=65536 laptop rows vary up to ~±35% for the same reason. The V100 table
+below is the stable reference.
 
 Both kernel generations stay in the binary — the delta *is* the point.
 
-**Remaining headroom, stated honestly:** q4+ sits at ~58–61% MBU (2.4× of a
-theoretical 3.76×) — the residual bottleneck is the nibble-unpack ALU chain
-and per-position scale loads; the next levers are wider per-lane tiles and
-staging scales for a tile of positions. At L=64K q4+ dips to ~49% MBU —
-split-count tuning territory. The harness re-probes the ceiling per device;
-the V100 table below came from the same `--bench` binary.
+**Remaining headroom, stated honestly:** with f16+ proving the memory path
+can run at 97–99% MBU on both devices, the residual gap in q8+/q4+ is the
+dequant chain itself — unpack, convert, and per-position scale loads
+competing with the softmax update for issue slots. The next levers are wider
+per-lane tiles and staging scales for a tile of positions. The harness
+re-probes the ceiling per device; the V100 table below came from the same
+`--bench` binary.
 
 ## Measured on the target: V100
 
 Rented V100 box (Tesla V100-FHHL-16GB, sm_70, 80 SMs, CUDA 12.4 toolchain),
-measured read ceiling **809 GB/s**. All 30 selftest cases pass on real Volta.
-Same harness, H=32, D=128, L=16384:
+measured read ceiling **809 GB/s**. All 36 selftest cases pass on real
+Volta. Same harness, H=32, D=128; two independent rentals — the L=4096 and
+L=16384 rows reproduce within ~1% across them, the naive kernels move up to
+~20% at L=65536 (ranges given below):
 
 | fmt | L | best ms | GB/s | MBU | tok/s | vs f16 |
 |-----|-------|---------|-------|-------|-------|--------|
-| f16 | 16384 | 0.597 | 449.6 | 55.6% | 1675 | 1.00× |
-| q8 (naive) | 16384 | 0.606 | 228.3 | 28.2% | 1650 | 0.98× |
-| **q8+** | 16384 | **0.256** | **540.7** | **66.8%** | **3906** | **2.33×** |
+| f16 | 16384 | 0.598 | 448.9 | 55.5% | 1672 | 1.00× |
+| **f16+** | 16384 | **0.343** | **782.5** | **96.7%** | 2915 | **1.74×** |
+| q8 (naive) | 16384 | 0.606 | 228.3 | 28.2% | 1650 | 0.99× |
+| **q8+** | 16384 | **0.255** | 542.8 | 67.1% | **3922** | **2.35×** |
 | q4 (naive) | 16384 | 0.750 | 95.1 | 11.8% | 1334 | 0.80× |
-| **q4+** | 16384 | **0.253** | **281.9** | **34.8%** | **3954** | **2.36×** |
+| **q4+** | 16384 | **0.254** | 280.8 | 34.7% | **3938** | **2.35×** |
 
-At L=4096: f16 6341 tok/s → q8+ 13378 (2.11×) → q4+ 13563 (2.14×).
-At L=65536: q8+ holds 571.5 GB/s (**2.41×**); q4+ reaches **2.75×**.
+At L=4096: f16 6300 tok/s → f16+ 10389 (1.65×) → q8+ 13378 (2.12×) → q4+
+13563 (2.15×). At L=65536: f16+ holds **99.1% MBU**; q8+ reaches 2.41–2.71×
+and q4+ **2.75–3.03×** across the two rentals.
 
-Volta makes the repo's point more sharply than Ada does:
+With the f16+ control in place, the V100 story separates cleanly:
 
-- **Naive compression loses outright on the target device.** q8 is 0.98× — a
-  wash; q4 is 0.80× — a 20% *slowdown* from quartering the bytes. Quantizing
-  the KV cache without restructuring the kernel is worse than doing nothing.
-- **The fp16 baseline itself is latency-limited on Volta**: ~53–57% MBU
-  against the probed ceiling, where the identical kernel holds 94% on Ada.
-  One position per warp doesn't put enough loads in flight for V100's
-  latency. So the restructure pays twice — q8+ at L=64K runs 2.41× against a
-  1.94× byte ratio, out-running compression because 4-positions-in-flight
-  also supplies the latency hiding the baseline lacks.
-- The obvious next kernel is **f16+** — the same 4-position restructure on
-  the uncompressed cache — to split the compression win from the
-  memory-level-parallelism win cleanly.
+1. **The obvious fp16 kernel is latency-limited on Volta.** One warp per
+   position issues too few loads in flight; it stalls at ~55% MBU where the
+   identical code holds ~93% on Ada. The restructure alone — no quantization
+   anywhere — is worth **1.65–1.74×** (f16+ at 97–99% MBU: effectively the
+   bandwidth roof of the device).
+2. **Compression converts to speed only after the kernel is restructured.**
+   Against the honest f16+ baseline, INT8 buys a further **1.3–1.6×** of its
+   1.94× byte ceiling, INT4 1.3–1.7× of 3.76× — the dequant chain and scale
+   loads eat the rest at V100's ~18 FLOP-per-byte budget. That ALU gap, not
+   the memory system, is the measured remaining headroom.
+3. **Naive quantization without the restructure is worse than doing
+   nothing**: q8 0.99×, q4 0.80× at L ≤ 16K — reproduced exactly across both
+   rentals; at L=64K the naive kernels wobble between 0.81× and parity, never
+   ahead. Shrinking bytes per position while keeping the per-position cost
+   fixed starves the memory system — compression fully wasted.
 
 (Card caveat: FHHL is the 150 W single-slot V100; SXM2 modules run 250–300 W
-with higher clocks, which should lift the latency-bound numbers.)
+with higher clocks, which should help the still-ALU-bound q4+ most.)
 
 ## Correctness (gated, not asserted)
 
-`voltattn` (no arguments) runs 30 cases — 5 formats × 6 shapes, including
+`voltattn` (no arguments) runs 36 cases — 6 formats × 6 shapes, including
 odd lengths (129/257/513/1000), both head dims (64/128), and multi-split
 paths — each checked against a **double-precision CPU reference computed on
 the exactly-dequantized values** (`q·s` at fp16-scale precision). The gate
