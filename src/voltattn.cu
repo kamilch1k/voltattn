@@ -319,13 +319,18 @@ __global__ void attn_q4(const uint8_t* __restrict__ K, const uint8_t* __restrict
     merge_and_store<P>(m, l, o, ws, D, blockIdx.x * S + s);
 }
 
-// ---------------------------------------------- q8+/q4+ (sub-warp MLP) ----
+// ----------------------------------------- f16+/q8+/q4+ (sub-warp MLP) ----
 // First-cut q8/q4 above hold only ~25-60% MBU: with 2-4x fewer bytes per
 // position, the fixed per-position cost (a 32-lane shuffle reduce + the
 // dependent online-softmax update) dominates and the memory system starves.
 // Fix: 8 lanes per position, 4 positions in flight per warp — 4x the loads
 // issued per iteration (128-bit loads for q8), a 3-shuffle reduce instead of
 // 5, and four independent softmax chains the scheduler can interleave.
+//
+// f16+ is the identical restructure with no quantization. It exists to split
+// the attribution: q8+ over f16+ is compression converting to speed at equal
+// memory-level parallelism; f16+ over f16 is parallelism the baseline left
+// on the table (on Volta: a lot — the baseline itself is latency-limited).
 
 template <int Pl> // dims per lane; D = 8 * Pl
 __device__ inline void merge_and_store16(float m, float l, const float* o,
@@ -354,6 +359,67 @@ __device__ inline void merge_and_store16(float m, float l, const float* o,
     float* slotp = ws + (size_t)slot * (D + 2);
     if (t == 0) { slotp[0] = mStar; slotp[1] = lStar; }
     if (t < D) slotp[2 + t] = od;
+}
+
+template <int Pl>
+__global__ void attn_f16_mlp(const __half* __restrict__ K, const __half* __restrict__ V,
+                             const __half* __restrict__ q, float* __restrict__ ws,
+                             int H, int L, int S, int chunk) {
+    const int D    = Pl * 8;
+    const int h    = blockIdx.x;
+    const int s    = blockIdx.y;
+    const int lane = threadIdx.x;
+    const int sl   = lane & 7;
+    const int sub  = threadIdx.y * 4 + (lane >> 3);
+    const unsigned subMask = 0xFFu << (lane & 24); // my 8-lane group
+    const int j0   = s * chunk;
+    const int j1   = min(L, j0 + chunk);
+
+    float qr[Pl];
+    {
+        const float scale = rsqrtf((float)D);
+        #pragma unroll
+        for (int p = 0; p < Pl; ++p)
+            qr[p] = __half2float(q[(size_t)h * D + sl * Pl + p]) * scale;
+    }
+
+    float m = -FLT_MAX, l = 0.f, o[Pl];
+    #pragma unroll
+    for (int p = 0; p < Pl; ++p) o[p] = 0.f;
+
+    for (int j = j0 + sub; j < j1; j += WARPS * 4) {
+        const size_t row = ((size_t)h * L + j) * D + (size_t)sl * Pl;
+        float kf[Pl], vf[Pl];
+        #pragma unroll
+        for (int seg = 0; seg < Pl / 8; ++seg) { // 8 halves = one 128-bit load
+            const int4 kw = *reinterpret_cast<const int4*>(K + row + seg * 8);
+            const int4 vw = *reinterpret_cast<const int4*>(V + row + seg * 8);
+            const __half2* kh = reinterpret_cast<const __half2*>(&kw);
+            const __half2* vh = reinterpret_cast<const __half2*>(&vw);
+            #pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                const float2 a = __half22float2(kh[k]);
+                const float2 b = __half22float2(vh[k]);
+                kf[seg * 8 + 2 * k] = a.x; kf[seg * 8 + 2 * k + 1] = a.y;
+                vf[seg * 8 + 2 * k] = b.x; vf[seg * 8 + 2 * k + 1] = b.y;
+            }
+        }
+        float acc = 0.f;
+        #pragma unroll
+        for (int p = 0; p < Pl; ++p) acc = fmaf(qr[p], kf[p], acc);
+        #pragma unroll
+        for (int off = 4; off > 0; off >>= 1)
+            acc += __shfl_xor_sync(subMask, acc, off);
+
+        const float mNew = fmaxf(m, acc);
+        const float c    = __expf(m - mNew);
+        const float e    = __expf(acc - mNew);
+        l = l * c + e;
+        m = mNew;
+        #pragma unroll
+        for (int p = 0; p < Pl; ++p) o[p] = o[p] * c + e * vf[p];
+    }
+    merge_and_store16<Pl>(m, l, o, ws, D, blockIdx.x * S + s);
 }
 
 template <int Pl>
@@ -519,18 +585,19 @@ __global__ void combine(const float* __restrict__ ws, __half* __restrict__ out,
 
 // ------------------------------------------------------------- host -------
 
-enum class Fmt { F16, Q8, Q8M, Q4, Q4M };
+enum class Fmt { F16, F16M, Q8, Q8M, Q4, Q4M };
 static const char* fmt_name(Fmt f) {
     switch (f) {
-        case Fmt::F16: return "f16";
-        case Fmt::Q8:  return "q8 ";
-        case Fmt::Q8M: return "q8+";
-        case Fmt::Q4:  return "q4 ";
-        default:       return "q4+";
+        case Fmt::F16:  return "f16";
+        case Fmt::F16M: return "f16+";
+        case Fmt::Q8:   return "q8 ";
+        case Fmt::Q8M:  return "q8+";
+        case Fmt::Q4:   return "q4 ";
+        default:        return "q4+";
     }
 }
 static bool is_q4(Fmt f) { return f == Fmt::Q4 || f == Fmt::Q4M; }
-static bool is_f16(Fmt f) { return f == Fmt::F16; }
+static bool is_f16(Fmt f) { return f == Fmt::F16 || f == Fmt::F16M; }
 
 struct Quantized {
     std::vector<int8_t>  q8;      // [H*L*D]
@@ -632,7 +699,8 @@ static void launch(Fmt f, const DeviceBufs& b, int H, int L, int D, int S) {
     const __half*  sV = (const __half*)b.scV;
     if (D == 128) {
         switch (f) {
-            case Fmt::F16: attn_f16<4><<<grid, block>>>((const __half*)b.K, (const __half*)b.V, b.q, b.ws, H, L, S, chunk); break;
+            case Fmt::F16:  attn_f16<4><<<grid, block>>>((const __half*)b.K, (const __half*)b.V, b.q, b.ws, H, L, S, chunk); break;
+            case Fmt::F16M: attn_f16_mlp<16><<<grid, block>>>((const __half*)b.K, (const __half*)b.V, b.q, b.ws, H, L, S, chunk); break;
             case Fmt::Q8:  attn_q8<4><<<grid, block>>>(K8, V8, sK, sV, b.q, b.ws, H, L, S, chunk); break;
             case Fmt::Q8M: attn_q8_mlp<16><<<grid, block>>>(K8, V8, sK, sV, b.q, b.ws, H, L, S, chunk); break;
             case Fmt::Q4:  attn_q4<4><<<grid, block>>>(K4, V4, sK, sV, b.q, b.ws, H, L, S, chunk); break;
@@ -640,7 +708,8 @@ static void launch(Fmt f, const DeviceBufs& b, int H, int L, int D, int S) {
         }
     } else {
         switch (f) {
-            case Fmt::F16: attn_f16<2><<<grid, block>>>((const __half*)b.K, (const __half*)b.V, b.q, b.ws, H, L, S, chunk); break;
+            case Fmt::F16:  attn_f16<2><<<grid, block>>>((const __half*)b.K, (const __half*)b.V, b.q, b.ws, H, L, S, chunk); break;
+            case Fmt::F16M: attn_f16_mlp<8><<<grid, block>>>((const __half*)b.K, (const __half*)b.V, b.q, b.ws, H, L, S, chunk); break;
             case Fmt::Q8:  attn_q8<2><<<grid, block>>>(K8, V8, sK, sV, b.q, b.ws, H, L, S, chunk); break;
             case Fmt::Q8M: attn_q8_mlp<8><<<grid, block>>>(K8, V8, sK, sV, b.q, b.ws, H, L, S, chunk); break;
             case Fmt::Q4:  attn_q4<2><<<grid, block>>>(K4, V4, sK, sV, b.q, b.ws, H, L, S, chunk); break;
@@ -733,7 +802,7 @@ static int selftest() {
         {40, 1000, 128, 2}, {8, 129, 64, 1}, {8, 513, 64, 4},
     };
     int fails = 0;
-    for (const Fmt f : {Fmt::F16, Fmt::Q8, Fmt::Q8M, Fmt::Q4, Fmt::Q4M}) {
+    for (const Fmt f : {Fmt::F16, Fmt::F16M, Fmt::Q8, Fmt::Q8M, Fmt::Q4, Fmt::Q4M}) {
         for (const Case& c : cases) {
             double maxerr = 0.0;
             const bool ok = run_case(f, c.H, c.L, c.D, c.S,
@@ -803,7 +872,7 @@ static void bench() {
         for (size_t i = 0; i < q.size(); ++i) q[i] = __float2half((float)((int)(i % 7) - 3) * 0.25f);
 
         double f16_ms = 0.0;
-        for (const Fmt f : {Fmt::F16, Fmt::Q8, Fmt::Q8M, Fmt::Q4, Fmt::Q4M}) {
+        for (const Fmt f : {Fmt::F16, Fmt::F16M, Fmt::Q8, Fmt::Q8M, Fmt::Q4, Fmt::Q4M}) {
             size_t payload, sbytes = 0;
             if (is_f16(f))        payload = n * 2;
             else if (!is_q4(f)) { payload = n;     sbytes = (size_t)H * L * G * 2; }
@@ -872,7 +941,7 @@ static void bench() {
             const double gbs  = (double)copy_bytes / (best_ms * 1e6);
             const double mbu  = gbs / ceil_gbs;
             const double toks = 1e3 / best_ms;
-            if (is_f16(f)) f16_ms = best_ms;
+            if (f == Fmt::F16) f16_ms = best_ms; // vs-f16 column stays vs the plain baseline
             std::printf("| %s | %-6d | %7.1fMB | %7.3f | %6.1f | %4.1f%% | %6.0f | %5.2fx |\n",
                         fmt_name(f), L, (double)copy_bytes / 1e6, best_ms, gbs, mbu * 100.0,
                         toks, f16_ms / best_ms);
