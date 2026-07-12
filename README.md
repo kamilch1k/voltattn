@@ -82,6 +82,12 @@ to 0.45 ms / 1.5× — the table shows a typical run, not the best one), and
 L=65536 laptop rows vary up to ~±35% for the same reason. The V100 table
 below is the stable reference.
 
+**q3+** (3-bit, ~4.9× byte ratio) lands where the attribution analysis
+predicts: ~60–81% MBU — the same ALU-bound regime as q4+, since 3-bit unpack
+is the heaviest chain of all — for **3.1–4.4× vs f16** on the laptop
+(25,040 tok/s at L=4096). Reported as a range, not a table row, pending the
+V100 run.
+
 Both kernel generations stay in the binary — the delta *is* the point.
 
 **Remaining headroom, stated honestly:** with f16+ proving the memory path
@@ -136,7 +142,7 @@ with higher clocks, which should help the still-ALU-bound q4+ most.)
 
 ## Correctness (gated, not asserted)
 
-`voltattn` (no arguments) runs 36 cases — 6 formats × 6 shapes, including
+`voltattn` (no arguments) runs 42 cases — 7 formats × 6 shapes, including
 odd lengths (129/257/513/1000), both head dims (64/128), and multi-split
 paths — each checked against a **double-precision CPU reference computed on
 the exactly-dequantized values** (`q·s` at fp16-scale precision). The gate
@@ -154,6 +160,11 @@ Deliberately standard-shaped, clean-room:
   fp16 scale per group.
 - **q4** — symmetric per-group scale, q ∈ [−7,7] stored as `(q+8)` nibbles,
   2 elems/byte.
+- **q3** — symmetric per-group scale, q ∈ [−3,3] stored as `(q+4)` in 3
+  bits, 8 elems per byte-aligned 3-byte granule (so the kernel's loads stay
+  aligned: 16-bit words at D=128, single bytes at D=64). Included because
+  aggressive KV-cache compression schemes land at ~3 bits; `q3+` only — the
+  naive-starves point is already made by q8/q4.
 
 Per-token or per-channel variants are drop-in swaps of the `quantize()` /
 scale-indexing pair; the kernel structure doesn't change.

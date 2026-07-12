@@ -560,6 +560,94 @@ __global__ void attn_q4_mlp(const uint8_t* __restrict__ K, const uint8_t* __rest
     merge_and_store16<Pl>(m, l, o, ws, D, blockIdx.x * S + s);
 }
 
+// q3+: 3-bit, 8 elems per byte-aligned 3-byte granule (~4.9x byte ratio vs
+// fp16 incl. scales). Same sub-warp structure; loads are 16-bit words (Pl=16)
+// or single bytes (Pl=8) since 6- and 3-byte lane tiles rule out wide loads.
+// Densest bytes, heaviest unpack — the format where Volta's ~18 FLOP/B
+// compute-to-bandwidth budget pushes back hardest.
+template <int Pl>
+__global__ void attn_q3_mlp(const uint8_t* __restrict__ K, const uint8_t* __restrict__ V,
+                            const __half* __restrict__ scK, const __half* __restrict__ scV,
+                            const __half* __restrict__ q, float* __restrict__ ws,
+                            int H, int L, int S, int chunk) {
+    const int D    = Pl * 8;
+    const int G    = D / GROUP;
+    const int h    = blockIdx.x;
+    const int s    = blockIdx.y;
+    const int lane = threadIdx.x;
+    const int sl   = lane & 7;
+    const int sub  = threadIdx.y * 4 + (lane >> 3);
+    const unsigned subMask = 0xFFu << (lane & 24); // my 8-lane group
+    const int g    = (sl * Pl) / GROUP;
+    const int j0   = s * chunk;
+    const int j1   = min(L, j0 + chunk);
+    constexpr int RB = Pl * 3 / 8; // bytes per lane per position: 6 or 3
+
+    float qr[Pl];
+    {
+        const float scale = rsqrtf((float)D);
+        #pragma unroll
+        for (int p = 0; p < Pl; ++p)
+            qr[p] = __half2float(q[(size_t)h * D + sl * Pl + p]) * scale;
+    }
+
+    float m = -FLT_MAX, l = 0.f, o[Pl];
+    #pragma unroll
+    for (int p = 0; p < Pl; ++p) o[p] = 0.f;
+
+    for (int j = j0 + sub; j < j1; j += WARPS * 4) {
+        const size_t row  = ((size_t)h * L + j) * (D * 3 / 8) + (size_t)sl * RB;
+        const size_t srow = ((size_t)h * L + j) * G + g;
+        uint32_t kg0, vg0;                       // granule: elems 0..7
+        [[maybe_unused]] uint32_t kg1 = 0, vg1 = 0; // elems 8..15 (Pl=16 only)
+        if constexpr (Pl == 16) { // 6 bytes = three aligned 16-bit words
+            const uint16_t* kp = reinterpret_cast<const uint16_t*>(K + row);
+            const uint16_t* vp = reinterpret_cast<const uint16_t*>(V + row);
+            const uint32_t k01 = kp[0] | ((uint32_t)kp[1] << 16);
+            const uint32_t v01 = vp[0] | ((uint32_t)vp[1] << 16);
+            kg0 = k01 & 0xFFFFFFu;               // bytes 0,1,2
+            vg0 = v01 & 0xFFFFFFu;
+            kg1 = (k01 >> 24) | ((uint32_t)kp[2] << 8); // bytes 3,4,5
+            vg1 = (v01 >> 24) | ((uint32_t)vp[2] << 8);
+        } else {                  // 3 bytes (odd offsets: byte loads)
+            kg0 = K[row] | ((uint32_t)K[row + 1] << 8) | ((uint32_t)K[row + 2] << 16);
+            vg0 = V[row] | ((uint32_t)V[row + 1] << 8) | ((uint32_t)V[row + 2] << 16);
+        }
+        const float ks = __half2float(scK[srow]);
+        const float vs = __half2float(scV[srow]);
+
+        float acc = 0.f;
+        #pragma unroll
+        for (int t = 0; t < 8; ++t)
+            acc = fmaf(qr[t], (float)((int)((kg0 >> (3 * t)) & 7) - 4), acc);
+        if constexpr (Pl == 16) {
+            #pragma unroll
+            for (int t = 0; t < 8; ++t)
+                acc = fmaf(qr[8 + t], (float)((int)((kg1 >> (3 * t)) & 7) - 4), acc);
+        }
+        acc *= ks;
+        #pragma unroll
+        for (int off = 4; off > 0; off >>= 1)
+            acc += __shfl_xor_sync(subMask, acc, off);
+
+        const float mNew = fmaxf(m, acc);
+        const float c    = __expf(m - mNew);
+        const float e    = __expf(acc - mNew);
+        l = l * c + e;
+        m = mNew;
+        const float ev = e * vs;
+        #pragma unroll
+        for (int t = 0; t < 8; ++t)
+            o[t] = o[t] * c + ev * (float)((int)((vg0 >> (3 * t)) & 7) - 4);
+        if constexpr (Pl == 16) {
+            #pragma unroll
+            for (int t = 0; t < 8; ++t)
+                o[8 + t] = o[8 + t] * c + ev * (float)((int)((vg1 >> (3 * t)) & 7) - 4);
+        }
+    }
+    merge_and_store16<Pl>(m, l, o, ws, D, blockIdx.x * S + s);
+}
+
 // Merge the S per-split partials of each head: same log-sum-exp merge.
 __global__ void combine(const float* __restrict__ ws, __half* __restrict__ out,
                         int S, int D) {
@@ -585,7 +673,7 @@ __global__ void combine(const float* __restrict__ ws, __half* __restrict__ out,
 
 // ------------------------------------------------------------- host -------
 
-enum class Fmt { F16, F16M, Q8, Q8M, Q4, Q4M };
+enum class Fmt { F16, F16M, Q8, Q8M, Q4, Q4M, Q3M };
 static const char* fmt_name(Fmt f) {
     switch (f) {
         case Fmt::F16:  return "f16";
@@ -593,44 +681,63 @@ static const char* fmt_name(Fmt f) {
         case Fmt::Q8:   return "q8 ";
         case Fmt::Q8M:  return "q8+";
         case Fmt::Q4:   return "q4 ";
-        default:        return "q4+";
+        case Fmt::Q4M:  return "q4+";
+        default:        return "q3+";
     }
 }
 static bool is_q4(Fmt f) { return f == Fmt::Q4 || f == Fmt::Q4M; }
+static bool is_q3(Fmt f) { return f == Fmt::Q3M; }
 static bool is_f16(Fmt f) { return f == Fmt::F16 || f == Fmt::F16M; }
+static int  qbits(Fmt f) { return is_q3(f) ? 3 : is_q4(f) ? 4 : 8; }
+static size_t qbytes(int bits, size_t n) { return bits == 8 ? n : bits == 4 ? n / 2 : n * 3 / 8; }
 
 struct Quantized {
     std::vector<int8_t>  q8;      // [H*L*D]
     std::vector<uint8_t> q4;      // [H*L*D/2]
+    std::vector<uint8_t> q3;      // [H*L*D*3/8] — 8 elems per 3-byte granule
     std::vector<__half>  scale;   // [H*L*D/GROUP]
+    const void* data(int bits) const {
+        return bits == 8 ? (const void*)q8.data()
+             : bits == 4 ? (const void*)q4.data() : (const void*)q3.data();
+    }
 };
 
 // Symmetric per-group quantizer. q8: round(x/s), s = max|x|/127.
 // q4: round(x/s) clamped to [-7,7], s = max|x|/7, stored as nibble+8.
-static Quantized quantize(const std::vector<float>& x, int H, int L, int D, bool four_bit) {
-    const int G = D / GROUP;
+// q3: clamped to [-3,3], s = max|x|/3, stored as (v+4) in 3 bits — 8 elems
+//     packed little-endian into each 3-byte granule.
+static Quantized quantize(const std::vector<float>& x, int H, int L, int D, int bits) {
+    const int G   = D / GROUP;
+    const int lim = bits == 8 ? 127 : bits == 4 ? 7 : 3;
     Quantized r;
     r.scale.resize((size_t)H * L * G);
-    if (four_bit) r.q4.resize((size_t)H * L * D / 2);
-    else          r.q8.resize((size_t)H * L * D);
+    if (bits == 8)      r.q8.resize((size_t)H * L * D);
+    else if (bits == 4) r.q4.resize((size_t)H * L * D / 2);
+    else                r.q3.assign((size_t)H * L * D * 3 / 8, 0);
     for (size_t rowg = 0; rowg < (size_t)H * L * G; ++rowg) {
         const size_t base = (rowg / G) * D + (rowg % G) * GROUP;
         float amax = 0.f;
         for (int i = 0; i < GROUP; ++i) amax = std::max(amax, std::fabs(x[base + i]));
-        const float s = amax > 0.f ? amax / (four_bit ? 7.f : 127.f) : 1.f;
+        const float s = amax > 0.f ? amax / (float)lim : 1.f;
         r.scale[rowg] = __float2half(s);
         const float sh = __half2float(r.scale[rowg]); // quantize against the stored scale
         for (int i = 0; i < GROUP; ++i) {
-            const int lim = four_bit ? 7 : 127;
             int v = (int)std::lrint(x[base + i] / sh);
             v = std::max(-lim, std::min(lim, v));
-            if (four_bit) {
+            if (bits == 8) {
+                r.q8[base + i] = (int8_t)v;
+            } else if (bits == 4) {
                 uint8_t& b = r.q4[(base + i) / 2];
                 const uint8_t nib = (uint8_t)(v + 8);
                 if ((base + i) % 2 == 0) b = (uint8_t)((b & 0xF0) | nib);
                 else                     b = (uint8_t)((b & 0x0F) | (nib << 4));
-            } else {
-                r.q8[base + i] = (int8_t)v;
+            } else { // 3-bit: elem e occupies bits 3*(e%8) of granule (e/8)
+                const size_t e     = base + i;
+                const size_t byte0 = (e / 8) * 3;
+                const int    bo    = (int)(e % 8) * 3;
+                const uint32_t enc = (uint32_t)(v + 4) << (bo & 7);
+                r.q3[byte0 + (bo >> 3)] |= (uint8_t)enc;
+                if ((bo & 7) + 3 > 8) r.q3[byte0 + (bo >> 3) + 1] |= (uint8_t)(enc >> 8);
             }
         }
     }
@@ -638,15 +745,21 @@ static Quantized quantize(const std::vector<float>& x, int H, int L, int D, bool
 }
 
 // Dequantized value as the kernel computes it, in double.
-static double dq(const Quantized& z, int H, int L, int D, bool four_bit, size_t idx) {
+static double dq(const Quantized& z, int H, int L, int D, int bits, size_t idx) {
     (void)H; (void)L;
     const int G = D / GROUP;
     const size_t rowg = (idx / D) * G + (idx % D) / GROUP;
     const double s = (double)__half2float(z.scale[rowg]);
     int v;
-    if (four_bit) {
+    if (bits == 4) {
         const uint8_t b = z.q4[idx / 2];
         v = (int)((idx % 2 == 0) ? (b & 0xF) : (b >> 4)) - 8;
+    } else if (bits == 3) {
+        const size_t byte0 = (idx / 8) * 3;
+        const int    bo    = (int)(idx % 8) * 3;
+        uint32_t w = z.q3[byte0 + (bo >> 3)];
+        if ((bo & 7) + 3 > 8) w |= (uint32_t)z.q3[byte0 + (bo >> 3) + 1] << 8;
+        v = (int)((w >> (bo & 7)) & 7) - 4;
     } else {
         v = z.q8[idx];
     }
@@ -704,7 +817,8 @@ static void launch(Fmt f, const DeviceBufs& b, int H, int L, int D, int S) {
             case Fmt::Q8:  attn_q8<4><<<grid, block>>>(K8, V8, sK, sV, b.q, b.ws, H, L, S, chunk); break;
             case Fmt::Q8M: attn_q8_mlp<16><<<grid, block>>>(K8, V8, sK, sV, b.q, b.ws, H, L, S, chunk); break;
             case Fmt::Q4:  attn_q4<4><<<grid, block>>>(K4, V4, sK, sV, b.q, b.ws, H, L, S, chunk); break;
-            default:       attn_q4_mlp<16><<<grid, block>>>(K4, V4, sK, sV, b.q, b.ws, H, L, S, chunk); break;
+            case Fmt::Q4M: attn_q4_mlp<16><<<grid, block>>>(K4, V4, sK, sV, b.q, b.ws, H, L, S, chunk); break;
+            default:       attn_q3_mlp<16><<<grid, block>>>(K4, V4, sK, sV, b.q, b.ws, H, L, S, chunk); break;
         }
     } else {
         switch (f) {
@@ -713,7 +827,8 @@ static void launch(Fmt f, const DeviceBufs& b, int H, int L, int D, int S) {
             case Fmt::Q8:  attn_q8<2><<<grid, block>>>(K8, V8, sK, sV, b.q, b.ws, H, L, S, chunk); break;
             case Fmt::Q8M: attn_q8_mlp<8><<<grid, block>>>(K8, V8, sK, sV, b.q, b.ws, H, L, S, chunk); break;
             case Fmt::Q4:  attn_q4<2><<<grid, block>>>(K4, V4, sK, sV, b.q, b.ws, H, L, S, chunk); break;
-            default:       attn_q4_mlp<8><<<grid, block>>>(K4, V4, sK, sV, b.q, b.ws, H, L, S, chunk); break;
+            case Fmt::Q4M: attn_q4_mlp<8><<<grid, block>>>(K4, V4, sK, sV, b.q, b.ws, H, L, S, chunk); break;
+            default:       attn_q3_mlp<8><<<grid, block>>>(K4, V4, sK, sV, b.q, b.ws, H, L, S, chunk); break;
         }
     }
     combine<<<H, 128>>>(b.ws, b.out, S, D);
@@ -737,11 +852,11 @@ static bool run_case(Fmt f, int H, int L, int D, int S, unsigned seed, double* m
         for (size_t i = 0; i < n; ++i) kd[i] = __half2float(__float2half(kx[i]));
         for (size_t i = 0; i < n; ++i) vd[i] = __half2float(__float2half(vx[i]));
     } else {
-        const bool fb = is_q4(f);
-        zk = quantize(kx, H, L, D, fb);
-        zv = quantize(vx, H, L, D, fb);
-        for (size_t i = 0; i < n; ++i) kd[i] = (float)dq(zk, H, L, D, fb, i);
-        for (size_t i = 0; i < n; ++i) vd[i] = (float)dq(zv, H, L, D, fb, i);
+        const int bits = qbits(f);
+        zk = quantize(kx, H, L, D, bits);
+        zv = quantize(vx, H, L, D, bits);
+        for (size_t i = 0; i < n; ++i) kd[i] = (float)dq(zk, H, L, D, bits, i);
+        for (size_t i = 0; i < n; ++i) vd[i] = (float)dq(zv, H, L, D, bits, i);
     }
     const std::vector<float> ref = reference(kd, vd, q, H, L, D);
 
@@ -754,14 +869,12 @@ static bool run_case(Fmt f, int H, int L, int D, int S, unsigned seed, double* m
         CUDA_CHECK(cudaMalloc(&b.K, n * 2)); CUDA_CHECK(cudaMalloc(&b.V, n * 2));
         CUDA_CHECK(cudaMemcpy(b.K, kh.data(), n * 2, cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(b.V, vh.data(), n * 2, cudaMemcpyHostToDevice));
-    } else if (!is_q4(f)) {
-        CUDA_CHECK(cudaMalloc(&b.K, n)); CUDA_CHECK(cudaMalloc(&b.V, n));
-        CUDA_CHECK(cudaMemcpy(b.K, zk.q8.data(), n, cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(b.V, zv.q8.data(), n, cudaMemcpyHostToDevice));
     } else {
-        CUDA_CHECK(cudaMalloc(&b.K, n / 2)); CUDA_CHECK(cudaMalloc(&b.V, n / 2));
-        CUDA_CHECK(cudaMemcpy(b.K, zk.q4.data(), n / 2, cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(b.V, zv.q4.data(), n / 2, cudaMemcpyHostToDevice));
+        const int bits = qbits(f);
+        const size_t bytes = qbytes(bits, n);
+        CUDA_CHECK(cudaMalloc(&b.K, bytes)); CUDA_CHECK(cudaMalloc(&b.V, bytes));
+        CUDA_CHECK(cudaMemcpy(b.K, zk.data(bits), bytes, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(b.V, zv.data(bits), bytes, cudaMemcpyHostToDevice));
     }
     if (!is_f16(f)) {
         const size_t ns = (size_t)H * L * G;
@@ -802,7 +915,7 @@ static int selftest() {
         {40, 1000, 128, 2}, {8, 129, 64, 1}, {8, 513, 64, 4},
     };
     int fails = 0;
-    for (const Fmt f : {Fmt::F16, Fmt::F16M, Fmt::Q8, Fmt::Q8M, Fmt::Q4, Fmt::Q4M}) {
+    for (const Fmt f : {Fmt::F16, Fmt::F16M, Fmt::Q8, Fmt::Q8M, Fmt::Q4, Fmt::Q4M, Fmt::Q3M}) {
         for (const Case& c : cases) {
             double maxerr = 0.0;
             const bool ok = run_case(f, c.H, c.L, c.D, c.S,
@@ -872,11 +985,10 @@ static void bench() {
         for (size_t i = 0; i < q.size(); ++i) q[i] = __float2half((float)((int)(i % 7) - 3) * 0.25f);
 
         double f16_ms = 0.0;
-        for (const Fmt f : {Fmt::F16, Fmt::F16M, Fmt::Q8, Fmt::Q8M, Fmt::Q4, Fmt::Q4M}) {
+        for (const Fmt f : {Fmt::F16, Fmt::F16M, Fmt::Q8, Fmt::Q8M, Fmt::Q4, Fmt::Q4M, Fmt::Q3M}) {
             size_t payload, sbytes = 0;
-            if (is_f16(f))        payload = n * 2;
-            else if (!is_q4(f)) { payload = n;     sbytes = (size_t)H * L * G * 2; }
-            else                { payload = n / 2; sbytes = (size_t)H * L * G * 2; }
+            if (is_f16(f)) payload = n * 2;
+            else { payload = qbytes(qbits(f), n); sbytes = (size_t)H * L * G * 2; }
             const size_t copy_bytes = 2 * (payload + sbytes); // K and V streams
             // rotate enough copies that the working set exceeds 256MB (cap: 16)
             const int copies = (int)std::min<size_t>(16, ((256ull << 20) + copy_bytes - 1) / copy_bytes);
@@ -889,9 +1001,8 @@ static void bench() {
                 for (size_t i = 0; i < n; ++i) kh[i] = __float2half(kx[i]);
                 for (size_t i = 0; i < n; ++i) vh[i] = __float2half(vx[i]);
             } else {
-                const bool fb = is_q4(f);
-                zk = quantize(kx, H, L, D, fb);
-                zv = quantize(vx, H, L, D, fb);
+                zk = quantize(kx, H, L, D, qbits(f));
+                zv = quantize(vx, H, L, D, qbits(f));
             }
 
             std::vector<DeviceBufs> bufs(copies);
@@ -902,8 +1013,8 @@ static void bench() {
                     CUDA_CHECK(cudaMemcpy(b.K, kh.data(), payload, cudaMemcpyHostToDevice));
                     CUDA_CHECK(cudaMemcpy(b.V, vh.data(), payload, cudaMemcpyHostToDevice));
                 } else {
-                    const void* ksrc = !is_q4(f) ? (const void*)zk.q8.data() : (const void*)zk.q4.data();
-                    const void* vsrc = !is_q4(f) ? (const void*)zv.q8.data() : (const void*)zv.q4.data();
+                    const void* ksrc = zk.data(qbits(f));
+                    const void* vsrc = zv.data(qbits(f));
                     CUDA_CHECK(cudaMalloc(&b.K, payload)); CUDA_CHECK(cudaMalloc(&b.V, payload));
                     CUDA_CHECK(cudaMemcpy(b.K, ksrc, payload, cudaMemcpyHostToDevice));
                     CUDA_CHECK(cudaMemcpy(b.V, vsrc, payload, cudaMemcpyHostToDevice));
