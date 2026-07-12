@@ -85,8 +85,8 @@ below is the stable reference.
 **q3+** (3-bit, ~4.9× byte ratio) lands where the attribution analysis
 predicts: ~60–81% MBU — the same ALU-bound regime as q4+, since 3-bit unpack
 is the heaviest chain of all — for **3.1–4.4× vs f16** on the laptop
-(25,040 tok/s at L=4096). Reported as a range, not a table row, pending the
-V100 run.
+(25,040 tok/s at L=4096). On the V100 the same kernel only *ties* q4+ —
+finding #4 in the V100 section below.
 
 Both kernel generations stay in the binary — the delta *is* the point.
 
@@ -101,10 +101,10 @@ re-probes the ceiling per device; the V100 table below came from the same
 ## Measured on the target: V100
 
 Rented V100 box (Tesla V100-FHHL-16GB, sm_70, 80 SMs, CUDA 12.4 toolchain),
-measured read ceiling **809 GB/s**. All 36 selftest cases pass on real
-Volta. Same harness, H=32, D=128; two independent rentals — the L=4096 and
-L=16384 rows reproduce within ~1% across them, the naive kernels move up to
-~20% at L=65536 (ranges given below):
+measured read ceiling **809 GB/s**. All 42 selftest cases pass on real
+Volta. Same harness, H=32, D=128; three independent rentals — the L=4096
+and L=16384 rows reproduce within ~1% across them, the naive kernels move
+up to ~20% at L=65536 (ranges given below):
 
 | fmt | L | best ms | GB/s | MBU | tok/s | vs f16 |
 |-----|-------|---------|-------|-------|-------|--------|
@@ -114,10 +114,12 @@ L=16384 rows reproduce within ~1% across them, the naive kernels move up to
 | **q8+** | 16384 | **0.255** | 542.8 | 67.1% | **3922** | **2.35×** |
 | q4 (naive) | 16384 | 0.750 | 95.1 | 11.8% | 1334 | 0.80× |
 | **q4+** | 16384 | **0.254** | 280.8 | 34.7% | **3938** | **2.35×** |
+| q3+ | 16384 | 0.265 | 205.6 | 25.4% | 3771 | 2.25× |
 
 At L=4096: f16 6300 tok/s → f16+ 10389 (1.65×) → q8+ 13378 (2.12×) → q4+
-13563 (2.15×). At L=65536: f16+ holds **99.1% MBU**; q8+ reaches 2.41–2.71×
-and q4+ **2.75–3.03×** across the two rentals.
+13563 (2.15×) → q3+ 13021 (2.07×). At L=65536: f16+ holds **99.1–99.5%
+MBU**; q8+ reaches 2.41–2.71×, q4+ **2.75–3.03×**, q3+ 2.74× across the
+rentals.
 
 With the f16+ control in place, the V100 story separates cleanly:
 
@@ -132,10 +134,18 @@ With the f16+ control in place, the V100 story separates cleanly:
    loads eat the rest at V100's ~18 FLOP-per-byte budget. That ALU gap, not
    the memory system, is the measured remaining headroom.
 3. **Naive quantization without the restructure is worse than doing
-   nothing**: q8 0.99×, q4 0.80× at L ≤ 16K — reproduced exactly across both
-   rentals; at L=64K the naive kernels wobble between 0.81× and parity, never
-   ahead. Shrinking bytes per position while keeping the per-position cost
-   fixed starves the memory system — compression fully wasted.
+   nothing**: q8 0.99×, q4 0.80× at L ≤ 16K — reproduced exactly across all
+   rentals; at L=64K the naive kernels wobble between 0.81× and ~parity,
+   never ahead. Shrinking bytes per position while keeping the per-position
+   cost fixed starves the memory system — compression fully wasted.
+4. **Past the ALU wall, denser bytes buy nothing: 3-bit ties 4-bit on
+   Volta.** q3+ carries ~24% fewer bytes than q4+ yet lands at the same
+   wall-clock at every length (2.07–2.74× vs 2.15–2.87×) — while on Ada,
+   with ~4× the compute budget per byte, the identical kernel converts
+   3-bit into 4.35× at L=4096. Once the dequant chain sets the clock,
+   further compression is free to store but worthless for speed. On Volta
+   the next token comes from cheaper unpack or a Volta-friendlier packing,
+   not a smaller cache.
 
 (Card caveat: FHHL is the 150 W single-slot V100; SXM2 modules run 250–300 W
 with higher clocks, which should help the still-ALU-bound q4+ most.)
