@@ -3,7 +3,7 @@
 [![CI](https://github.com/kamilch1k/voltattn/actions/workflows/ci.yml/badge.svg)](https://github.com/kamilch1k/voltattn/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**A fused dequant + attention decode kernel, written for sm_70 (Volta / V100).**
+**A fused dequant + attention decode kernel, written for — and measured on — sm_70 (Volta / V100).**
 
 A quantized KV cache is a *memory* win. Batch-1 decode attention is
 *bandwidth*-bound. The only way the first becomes a *speed* win is a kernel
@@ -74,9 +74,43 @@ Both kernel generations stay in the binary — the delta *is* the point.
 theoretical 3.76×) — the residual bottleneck is the nibble-unpack ALU chain
 and per-position scale loads; the next levers are wider per-lane tiles and
 staging scales for a tile of positions. At L=64K q4+ dips to ~49% MBU —
-split-count tuning territory. V100 numbers land after a rented-V100 run; the
-harness re-probes the ceiling per device, so the same `--bench` command
-produces the Volta table.
+split-count tuning territory. The harness re-probes the ceiling per device;
+the V100 table below came from the same `--bench` binary.
+
+## Measured on the target: V100
+
+Rented V100 box (Tesla V100-FHHL-16GB, sm_70, 80 SMs, CUDA 12.4 toolchain),
+measured read ceiling **809 GB/s**. All 30 selftest cases pass on real Volta.
+Same harness, H=32, D=128, L=16384:
+
+| fmt | L | best ms | GB/s | MBU | tok/s | vs f16 |
+|-----|-------|---------|-------|-------|-------|--------|
+| f16 | 16384 | 0.597 | 449.6 | 55.6% | 1675 | 1.00× |
+| q8 (naive) | 16384 | 0.606 | 228.3 | 28.2% | 1650 | 0.98× |
+| **q8+** | 16384 | **0.256** | **540.7** | **66.8%** | **3906** | **2.33×** |
+| q4 (naive) | 16384 | 0.750 | 95.1 | 11.8% | 1334 | 0.80× |
+| **q4+** | 16384 | **0.253** | **281.9** | **34.8%** | **3954** | **2.36×** |
+
+At L=4096: f16 6341 tok/s → q8+ 13378 (2.11×) → q4+ 13563 (2.14×).
+At L=65536: q8+ holds 571.5 GB/s (**2.41×**); q4+ reaches **2.75×**.
+
+Volta makes the repo's point more sharply than Ada does:
+
+- **Naive compression loses outright on the target device.** q8 is 0.98× — a
+  wash; q4 is 0.80× — a 20% *slowdown* from quartering the bytes. Quantizing
+  the KV cache without restructuring the kernel is worse than doing nothing.
+- **The fp16 baseline itself is latency-limited on Volta**: ~53–57% MBU
+  against the probed ceiling, where the identical kernel holds 94% on Ada.
+  One position per warp doesn't put enough loads in flight for V100's
+  latency. So the restructure pays twice — q8+ at L=64K runs 2.41× against a
+  1.94× byte ratio, out-running compression because 4-positions-in-flight
+  also supplies the latency hiding the baseline lacks.
+- The obvious next kernel is **f16+** — the same 4-position restructure on
+  the uncompressed cache — to split the compression win from the
+  memory-level-parallelism win cleanly.
+
+(Card caveat: FHHL is the 150 W single-slot V100; SXM2 modules run 250–300 W
+with higher clocks, which should lift the latency-bound numbers.)
 
 ## Correctness (gated, not asserted)
 

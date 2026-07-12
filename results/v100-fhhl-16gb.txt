@@ -1,0 +1,93 @@
+$ echo '=== SELFTEST ==='
+=== SELFTEST ===
+$ ./build/voltattn
+f16  H=8   L=257   D=128 S=1   maxerr=1.16e-04  PASS
+f16  H=8   L=257   D=128 S=3   maxerr=1.08e-04  PASS
+f16  H=2   L=4096  D=128 S=5   maxerr=2.73e-05  PASS
+f16  H=40  L=1000  D=128 S=2   maxerr=5.93e-05  PASS
+f16  H=8   L=129   D=64  S=1   maxerr=1.09e-04  PASS
+f16  H=8   L=513   D=64  S=4   maxerr=5.55e-05  PASS
+q8   H=8   L=257   D=128 S=1   maxerr=1.19e-04  PASS
+q8   H=8   L=257   D=128 S=3   maxerr=1.16e-04  PASS
+q8   H=2   L=4096  D=128 S=5   maxerr=2.31e-05  PASS
+q8   H=40  L=1000  D=128 S=2   maxerr=6.00e-05  PASS
+q8   H=8   L=129   D=64  S=1   maxerr=1.20e-04  PASS
+q8   H=8   L=513   D=64  S=4   maxerr=5.76e-05  PASS
+q8+  H=8   L=257   D=128 S=1   maxerr=1.19e-04  PASS
+q8+  H=8   L=257   D=128 S=3   maxerr=1.16e-04  PASS
+q8+  H=2   L=4096  D=128 S=5   maxerr=2.31e-05  PASS
+q8+  H=40  L=1000  D=128 S=2   maxerr=6.00e-05  PASS
+q8+  H=8   L=129   D=64  S=1   maxerr=1.20e-04  PASS
+q8+  H=8   L=513   D=64  S=4   maxerr=5.76e-05  PASS
+q4   H=8   L=257   D=128 S=1   maxerr=1.21e-04  PASS
+q4   H=8   L=257   D=128 S=3   maxerr=1.16e-04  PASS
+q4   H=2   L=4096  D=128 S=5   maxerr=2.63e-05  PASS
+q4   H=40  L=1000  D=128 S=2   maxerr=6.09e-05  PASS
+q4   H=8   L=129   D=64  S=1   maxerr=1.18e-04  PASS
+q4   H=8   L=513   D=64  S=4   maxerr=6.10e-05  PASS
+q4+  H=8   L=257   D=128 S=1   maxerr=1.21e-04  PASS
+q4+  H=8   L=257   D=128 S=3   maxerr=1.16e-04  PASS
+q4+  H=2   L=4096  D=128 S=5   maxerr=2.63e-05  PASS
+q4+  H=40  L=1000  D=128 S=2   maxerr=6.09e-05  PASS
+q4+  H=8   L=129   D=64  S=1   maxerr=1.18e-04  PASS
+q4+  H=8   L=513   D=64  S=4   maxerr=6.10e-05  PASS
+all cases passed
+$ echo '=== PROBE ==='
+=== PROBE ===
+$ ./build/voltattn --probe
+measured read ceiling: 811.6 GB/s
+$ echo '=== BENCH ==='
+=== BENCH ===
+$ ./build/voltattn --bench
+f16  H=8   L=257   D=128 S=1   maxerr=1.16e-04  PASS
+f16  H=8   L=257   D=128 S=3   maxerr=1.08e-04  PASS
+f16  H=2   L=4096  D=128 S=5   maxerr=2.73e-05  PASS
+f16  H=40  L=1000  D=128 S=2   maxerr=5.93e-05  PASS
+f16  H=8   L=129   D=64  S=1   maxerr=1.09e-04  PASS
+f16  H=8   L=513   D=64  S=4   maxerr=5.55e-05  PASS
+q8   H=8   L=257   D=128 S=1   maxerr=1.19e-04  PASS
+q8   H=8   L=257   D=128 S=3   maxerr=1.16e-04  PASS
+q8   H=2   L=4096  D=128 S=5   maxerr=2.31e-05  PASS
+q8   H=40  L=1000  D=128 S=2   maxerr=6.00e-05  PASS
+q8   H=8   L=129   D=64  S=1   maxerr=1.20e-04  PASS
+q8   H=8   L=513   D=64  S=4   maxerr=5.76e-05  PASS
+q8+  H=8   L=257   D=128 S=1   maxerr=1.19e-04  PASS
+q8+  H=8   L=257   D=128 S=3   maxerr=1.16e-04  PASS
+q8+  H=2   L=4096  D=128 S=5   maxerr=2.31e-05  PASS
+q8+  H=40  L=1000  D=128 S=2   maxerr=6.00e-05  PASS
+q8+  H=8   L=129   D=64  S=1   maxerr=1.20e-04  PASS
+q8+  H=8   L=513   D=64  S=4   maxerr=5.76e-05  PASS
+q4   H=8   L=257   D=128 S=1   maxerr=1.21e-04  PASS
+q4   H=8   L=257   D=128 S=3   maxerr=1.16e-04  PASS
+q4   H=2   L=4096  D=128 S=5   maxerr=2.63e-05  PASS
+q4   H=40  L=1000  D=128 S=2   maxerr=6.09e-05  PASS
+q4   H=8   L=129   D=64  S=1   maxerr=1.18e-04  PASS
+q4   H=8   L=513   D=64  S=4   maxerr=6.10e-05  PASS
+q4+  H=8   L=257   D=128 S=1   maxerr=1.21e-04  PASS
+q4+  H=8   L=257   D=128 S=3   maxerr=1.16e-04  PASS
+q4+  H=2   L=4096  D=128 S=5   maxerr=2.63e-05  PASS
+q4+  H=40  L=1000  D=128 S=2   maxerr=6.09e-05  PASS
+q4+  H=8   L=129   D=64  S=1   maxerr=1.18e-04  PASS
+q4+  H=8   L=513   D=64  S=4   maxerr=6.10e-05  PASS
+all cases passed
+device: Tesla V100-FHHL-16GB (sm_70, 80 SMs)
+measured read ceiling: 809.1 GB/s
+| fmt | L      | KV bytes | best ms | GB/s   | MBU   | tok/s  | vs f16 |
+|-----|--------|----------|---------|--------|-------|--------|--------|
+| f16 | 4096   |    67.1MB |   0.158 |  425.6 | 52.6% |   6341 |  1.00x |
+| q8  | 4096   |    34.6MB |   0.160 |  216.6 | 26.8% |   6260 |  0.99x |
+| q8+ | 4096   |    34.6MB |   0.075 |  462.9 | 57.2% |  13378 |  2.11x |
+| q4  | 4096   |    17.8MB |   0.197 |   90.7 | 11.2% |   5086 |  0.80x |
+| q4+ | 4096   |    17.8MB |   0.074 |  241.8 | 29.9% |  13563 |  2.14x |
+| f16 | 16384  |   268.4MB |   0.597 |  449.6 | 55.6% |   1675 |  1.00x |
+| q8  | 16384  |   138.4MB |   0.606 |  228.3 | 28.2% |   1650 |  0.98x |
+| q8+ | 16384  |   138.4MB |   0.256 |  540.7 | 66.8% |   3906 |  2.33x |
+| q4  | 16384  |    71.3MB |   0.750 |   95.1 | 11.8% |   1334 |  0.80x |
+| q4+ | 16384  |    71.3MB |   0.253 |  281.9 | 34.8% |   3954 |  2.36x |
+| f16 | 65536  |  1073.7MB |   2.331 |  460.7 | 56.9% |    429 |  1.00x |
+| q8  | 65536  |   553.6MB |   2.381 |  232.5 | 28.7% |    420 |  0.98x |
+| q8+ | 65536  |   553.6MB |   0.969 |  571.5 | 70.6% |   1032 |  2.41x |
+| q4  | 65536  |   285.2MB |   2.862 |   99.7 | 12.3% |    349 |  0.81x |
+| q4+ | 65536  |   285.2MB |   0.848 |  336.4 | 41.6% |   1179 |  2.75x |
+bytes = compressed K+V payload + fp16 group scales; q/out/workspace excluded (<0.1%).
+KV working set rotated across up to 16 copies (>=256MB) so L2 cannot serve the stream.
