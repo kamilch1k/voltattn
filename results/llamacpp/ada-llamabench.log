@@ -1,0 +1,27 @@
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 12281 MiB):
+  Device 0: NVIDIA GeForce RTX 4080 Laptop GPU, compute capability 8.9, VMM: yes, VRAM: 12281 MiB
+| model                          |       size |     params | backend    | ngl |  fa |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | --: | --: | --------------: | -------------------: |
+| qwen2 1.5B Q4_0                | 1011.16 MiB |     1.78 B | CUDA       |  -1 |   1 |            tg32 |        269.54 ± 8.14 |
+| qwen2 1.5B Q4_0                | 1011.16 MiB |     1.78 B | CUDA       |  -1 |   1 |    tg32 @ d4096 |       209.52 ± 41.34 |
+| qwen2 1.5B Q4_0                | 1011.16 MiB |     1.78 B | CUDA       |  -1 |   1 |   tg32 @ d16384 |       191.43 ± 10.71 |
+
+build: 6eddde0 (1)
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 12281 MiB):
+  Device 0: NVIDIA GeForce RTX 4080 Laptop GPU, compute capability 8.9, VMM: yes, VRAM: 12281 MiB
+| model                          |       size |     params | backend    | ngl | type_k | type_v |  fa |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | --: | -----: | -----: | --: | --------------: | -------------------: |
+| qwen2 1.5B Q4_0                | 1011.16 MiB |     1.78 B | CUDA       |  -1 |   q8_0 |   q8_0 |   1 |            tg32 |       252.28 ± 12.70 |
+| qwen2 1.5B Q4_0                | 1011.16 MiB |     1.78 B | CUDA       |  -1 |   q8_0 |   q8_0 |   1 |    tg32 @ d4096 |        237.15 ± 6.16 |
+| qwen2 1.5B Q4_0                | 1011.16 MiB |     1.78 B | CUDA       |  -1 |   q8_0 |   q8_0 |   1 |   tg32 @ d16384 |        189.31 ± 1.88 |
+
+build: 6eddde0 (1)
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 12281 MiB):
+  Device 0: NVIDIA GeForce RTX 4080 Laptop GPU, compute capability 8.9, VMM: yes, VRAM: 12281 MiB
+| model                          |       size |     params | backend    | ngl | type_k | type_v |  fa |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | --: | -----: | -----: | --: | --------------: | -------------------: |
+| qwen2 1.5B Q4_0                | 1011.16 MiB |     1.78 B | CUDA       |  -1 |   q4_0 |   q4_0 |   1 |            tg32 |        263.76 ± 6.64 |
+| qwen2 1.5B Q4_0                | 1011.16 MiB |     1.78 B | CUDA       |  -1 |   q4_0 |   q4_0 |   1 |    tg32 @ d4096 |        237.07 ± 4.60 |
+| qwen2 1.5B Q4_0                | 1011.16 MiB |     1.78 B | CUDA       |  -1 |   q4_0 |   q4_0 |   1 |   tg32 @ d16384 |        177.86 ± 7.77 |
+
+build: 6eddde0 (1)
